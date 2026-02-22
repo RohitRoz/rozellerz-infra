@@ -1,0 +1,103 @@
+name: Deploy rozellerz.com
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options: [prod, dev]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  DOMAIN_NAME: rozellerz.com
+  ACM_CERT_ARN: arn:aws:acm:us-east-1:882951811364:certificate/4f22715e-3c41-4c9e-98e8-f4cc630eef7b
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set environment variables
+        id: env
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" == "prod" ]] || [[ "${{ github.ref }}" == "refs/heads/main" && "${{ github.event_name }}" == "push" ]]; then
+            echo "ENV=prod" >> $GITHUB_OUTPUT
+            echo "STACK_NAME=rozellerz-prod" >> $GITHUB_OUTPUT
+            echo "CERT_ARN=${{ env.ACM_CERT_ARN }}" >> $GITHUB_OUTPUT
+          else
+            echo "ENV=dev" >> $GITHUB_OUTPUT
+            echo "STACK_NAME=rozellerz-dev" >> $GITHUB_OUTPUT
+            echo "CERT_ARN=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file cloudformation/stack.yml \
+            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
+            --parameter-overrides \
+              Environment=${{ steps.env.outputs.ENV }} \
+              DomainName=${{ env.DOMAIN_NAME }} \
+              AcmCertificateArn=${{ steps.env.outputs.CERT_ARN }} \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_IAM
+
+      - name: Get stack outputs
+        id: stack
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text)
+          CF_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" \
+            --output text)
+          SITE_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='SiteUrl'].OutputValue" \
+            --output text)
+          echo "BUCKET=$BUCKET" >> $GITHUB_OUTPUT
+          echo "CF_ID=$CF_ID" >> $GITHUB_OUTPUT
+          echo "SITE_URL=$SITE_URL" >> $GITHUB_OUTPUT
+
+      - name: Sync site to S3
+        run: |
+          aws s3 sync site/ s3://${{ steps.stack.outputs.BUCKET }}/ \
+            --delete \
+            --cache-control "max-age=86400" \
+          aws s3 cp site/index.html s3://${{ steps.stack.outputs.BUCKET }}/index.html \
+            --content-type text/html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.stack.outputs.CF_ID }} \
+            --paths "/*"
+
+      - name: Deploy summary
+        run: |
+          echo "## 🚀 Deployed to ${{ steps.env.outputs.ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ steps.stack.outputs.SITE_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Bucket:** ${{ steps.stack.outputs.BUCKET }}" >> $GITHUB_STEP_SUMMARY
+          echo "**CloudFront:** ${{ steps.stack.outputs.CF_ID }}" >> $GITHUB_STEP_SUMMARY
