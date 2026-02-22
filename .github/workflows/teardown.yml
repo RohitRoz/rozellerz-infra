@@ -1,0 +1,76 @@
+name: Teardown Stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options: [dev, prod]
+      confirm:
+        description: 'Type DESTROY to confirm'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'DESTROY'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set variables
+        id: env
+        run: |
+          echo "STACK_NAME=rozellerz-${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          echo "ENV=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+
+      - name: Empty S3 buckets
+        run: |
+          SITE_BUCKET="${{ steps.env.outputs.ENV == 'prod' && 'rozellerz.com' || 'dev-rozellerz.com' }}"
+          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
+          for BUCKET in "$SITE_BUCKET" "$DEPLOY_BUCKET"; do
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              echo "Emptying $BUCKET..."
+              aws s3 rm "s3://${BUCKET}" --recursive
+              # Also delete old versions
+              aws s3api list-object-versions --bucket "$BUCKET" --output json \
+                | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for v in data.get('Versions', []) + data.get('DeleteMarkers', []):
+              print(v['Key'], v['VersionId'])
+          " | while read key vid; do
+                aws s3api delete-object --bucket "$BUCKET" --key "$key" --version-id "$vid" 2>/dev/null || true
+              done
+            fi
+          done
+
+      - name: Delete CloudFormation stack
+        run: |
+          STACK="${{ steps.env.outputs.STACK_NAME }}"
+          echo "Deleting stack: $STACK"
+          aws cloudformation delete-stack --stack-name "$STACK"
+          echo "Waiting for stack deletion..."
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+          echo "Stack $STACK deleted."
+
+      - name: Teardown summary
+        run: |
+          echo "## 🗑️ Destroyed ${{ steps.env.outputs.ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Stack **${{ steps.env.outputs.STACK_NAME }}** and all resources deleted." >> $GITHUB_STEP_SUMMARY

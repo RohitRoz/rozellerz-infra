@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: rozellerz.com - S3 static site with CloudFront CDN
+Description: rozellerz.com - Dynamic site with S3 + CloudFront + Lambda + API Gateway + DynamoDB + WAF
 
 Parameters:
   Environment:
@@ -19,7 +19,10 @@ Conditions:
   HasCertificate: !Not [!Equals [!Ref AcmCertificateArn, '']]
 
 Resources:
-  # --- S3 Bucket ---
+
+  # =========================================
+  #  S3 — Static Assets
+  # =========================================
   SiteBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -30,16 +33,281 @@ Resources:
       WebsiteConfiguration:
         IndexDocument: index.html
         ErrorDocument: index.html
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
       Tags:
         - Key: Environment
           Value: !Ref Environment
 
-  # --- CloudFront Origin Access Control ---
+  # ---- Lambda deploy bucket ----
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-rozellerz-deploy'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # =========================================
+  #  DynamoDB — Page Content
+  # =========================================
+  PagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-rozellerz-pages'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      AttributeDefinitions:
+        - AttributeName: slug
+          AttributeType: S
+      KeySchema:
+        - AttributeName: slug
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =========================================
+  #  IAM — Lambda Execution Role
+  # =========================================
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-rozellerz-lambda'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt PagesTable.Arn
+
+  # =========================================
+  #  Lambda — API Backend
+  # =========================================
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-rozellerz-api'
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: lambda/api.zip
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PagesTable
+          ENVIRONMENT: !Ref Environment
+          ALLOWED_ORIGIN: !If
+            - IsProd
+            - !Sub 'https://www.${DomainName}'
+            - '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =========================================
+  #  API Gateway — HTTP API
+  # =========================================
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${Environment}-rozellerz-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !If
+            - IsProd
+            - !Sub 'https://www.${DomainName}'
+            - '*'
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: ['Content-Type', 'Authorization']
+        MaxAge: 86400
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ApiRouteGetPages:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /api/pages'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiRouteGetPage:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /api/pages/{slug}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+  ApiRoutePutPage:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'PUT /api/pages/{slug}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiRouteDeletePage:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'DELETE /api/pages/{slug}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # =========================================
+  #  WAF — Web Application Firewall
+  # =========================================
+  WafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${Environment}-rozellerz-waf'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${Environment}RozellerzWaf'
+      Rules:
+        - Name: AWSCommonRules
+          Priority: 1
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRules
+        - Name: AWSKnownBadInputs
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputs
+        - Name: RateLimit
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimit
+
+  # =========================================
+  #  CloudFront — Security Headers
+  # =========================================
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${Environment}-rozellerz-security-headers'
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Protection: true
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://*.execute-api.us-east-1.amazonaws.com"
+            Override: true
+
+  # =========================================
+  #  CloudFront — OAC + Distribution
+  # =========================================
   CloudFrontOAC:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
@@ -49,7 +317,6 @@ Resources:
         SigningBehavior: always
         SigningProtocol: sigv4
 
-  # --- CloudFront Distribution ---
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -59,6 +326,7 @@ Resources:
         Comment: !Sub '${Environment} - rozellerz.com'
         HttpVersion: http2and3
         PriceClass: PriceClass_100
+        WebACLId: !GetAtt WafWebAcl.Arn
         Aliases: !If
           - HasCertificate
           - - !If [IsProd, !Ref DomainName, !Ref 'AWS::NoValue']
@@ -76,13 +344,28 @@ Resources:
             OriginAccessControlId: !Ref CloudFrontOAC
             S3OriginConfig:
               OriginAccessIdentity: ''
+          - Id: ApiOrigin
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
           Compress: true
           AllowedMethods: [GET, HEAD]
           CachedMethods: [GET, HEAD]
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
         CustomErrorResponses:
           - ErrorCode: 403
             ResponseCode: 200
@@ -94,7 +377,7 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # --- S3 Bucket Policy for CloudFront OAC ---
+  # ---- S3 Bucket Policy for CloudFront ----
   BucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -102,7 +385,7 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: AllowCloudFrontServicePrincipal
+          - Sid: AllowCloudFrontOAC
             Effect: Allow
             Principal:
               Service: cloudfront.amazonaws.com
@@ -112,11 +395,18 @@ Resources:
               StringEquals:
                 'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
 
+# =========================================
+#  Outputs
+# =========================================
 Outputs:
   BucketName:
     Value: !Ref SiteBucket
     Export:
       Name: !Sub '${Environment}-rozellerz-bucket'
+  DeployBucketName:
+    Value: !Ref DeployBucket
+    Export:
+      Name: !Sub '${Environment}-rozellerz-deploy-bucket'
   CloudFrontDistributionId:
     Value: !Ref CloudFrontDistribution
     Export:
@@ -125,6 +415,14 @@ Outputs:
     Value: !GetAtt CloudFrontDistribution.DomainName
     Export:
       Name: !Sub '${Environment}-rozellerz-cf-domain'
+  ApiEndpoint:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${Environment}-rozellerz-api'
+  PagesTableName:
+    Value: !Ref PagesTable
+  LambdaFunctionName:
+    Value: !Ref ApiFunction
   SiteUrl:
     Value: !If
       - IsProd

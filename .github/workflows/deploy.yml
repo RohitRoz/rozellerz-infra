@@ -10,6 +10,11 @@ on:
         required: true
         type: choice
         options: [prod, dev]
+      seed_db:
+        description: 'Seed DynamoDB with page content'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -24,9 +29,15 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -48,6 +59,31 @@ jobs:
             echo "CERT_ARN=" >> $GITHUB_OUTPUT
           fi
 
+      # ---- Bootstrap: ensure deploy bucket exists before CF ----
+      - name: Create deploy bucket if needed
+        run: |
+          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
+          if ! aws s3api head-bucket --bucket "$DEPLOY_BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$DEPLOY_BUCKET" --region ${{ env.AWS_REGION }}
+            aws s3api put-bucket-encryption --bucket "$DEPLOY_BUCKET" \
+              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            aws s3api put-public-access-block --bucket "$DEPLOY_BUCKET" \
+              --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+          fi
+
+      # ---- Package & upload Lambda ----
+      - name: Package Lambda
+        run: |
+          cd api
+          zip -r ../lambda-api.zip .
+          cd ..
+
+      - name: Upload Lambda to S3
+        run: |
+          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
+          aws s3 cp lambda-api.zip "s3://${DEPLOY_BUCKET}/lambda/api.zip"
+
+      # ---- Deploy CloudFormation ----
       - name: Deploy CloudFormation stack
         run: |
           aws cloudformation deploy \
@@ -56,48 +92,71 @@ jobs:
             --parameter-overrides \
               Environment=${{ steps.env.outputs.ENV }} \
               DomainName=${{ env.DOMAIN_NAME }} \
-              AcmCertificateArn=${{ steps.env.outputs.CERT_ARN }} \
+              AcmCertificateArn="${{ steps.env.outputs.CERT_ARN }}" \
             --no-fail-on-empty-changeset \
-            --capabilities CAPABILITY_IAM
+            --capabilities CAPABILITY_NAMED_IAM
 
+      # ---- Get stack outputs ----
       - name: Get stack outputs
         id: stack
         run: |
-          BUCKET=$(aws cloudformation describe-stacks \
-            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
-            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
-            --output text)
-          CF_ID=$(aws cloudformation describe-stacks \
-            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
-            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" \
-            --output text)
-          SITE_URL=$(aws cloudformation describe-stacks \
-            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
-            --query "Stacks[0].Outputs[?OutputKey=='SiteUrl'].OutputValue" \
-            --output text)
-          echo "BUCKET=$BUCKET" >> $GITHUB_OUTPUT
-          echo "CF_ID=$CF_ID" >> $GITHUB_OUTPUT
-          echo "SITE_URL=$SITE_URL" >> $GITHUB_OUTPUT
+          get_output() {
+            aws cloudformation describe-stacks \
+              --stack-name ${{ steps.env.outputs.STACK_NAME }} \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
+              --output text
+          }
+          echo "BUCKET=$(get_output BucketName)" >> $GITHUB_OUTPUT
+          echo "CF_ID=$(get_output CloudFrontDistributionId)" >> $GITHUB_OUTPUT
+          echo "SITE_URL=$(get_output SiteUrl)" >> $GITHUB_OUTPUT
+          echo "TABLE=$(get_output PagesTableName)" >> $GITHUB_OUTPUT
+          echo "LAMBDA=$(get_output LambdaFunctionName)" >> $GITHUB_OUTPUT
+          echo "API=$(get_output ApiEndpoint)" >> $GITHUB_OUTPUT
 
+      # ---- Sync site to S3 ----
       - name: Sync site to S3
         run: |
           aws s3 sync site/ s3://${{ steps.stack.outputs.BUCKET }}/ \
             --delete \
-            --cache-control "max-age=86400" \
+            --cache-control "max-age=86400"
           aws s3 cp site/index.html s3://${{ steps.stack.outputs.BUCKET }}/index.html \
             --content-type text/html \
             --cache-control "no-cache, no-store, must-revalidate"
 
+      # ---- Update Lambda code ----
+      - name: Update Lambda function code
+        run: |
+          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
+          aws lambda update-function-code \
+            --function-name ${{ steps.stack.outputs.LAMBDA }} \
+            --s3-bucket "$DEPLOY_BUCKET" \
+            --s3-key lambda/api.zip \
+            --publish
+
+      # ---- Seed DynamoDB (first deploy or manual) ----
+      - name: Seed DynamoDB
+        if: github.event.inputs.seed_db == 'true'
+        run: |
+          pip install boto3
+          python scripts/seed.py ${{ steps.stack.outputs.TABLE }}
+
+      # ---- Invalidate CloudFront ----
       - name: Invalidate CloudFront
         run: |
           aws cloudfront create-invalidation \
             --distribution-id ${{ steps.stack.outputs.CF_ID }} \
             --paths "/*"
 
+      # ---- Summary ----
       - name: Deploy summary
         run: |
           echo "## 🚀 Deployed to ${{ steps.env.outputs.ENV }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**URL:** ${{ steps.stack.outputs.SITE_URL }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Bucket:** ${{ steps.stack.outputs.BUCKET }}" >> $GITHUB_STEP_SUMMARY
-          echo "**CloudFront:** ${{ steps.stack.outputs.CF_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Site** | ${{ steps.stack.outputs.SITE_URL }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **API** | ${{ steps.stack.outputs.API }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Bucket** | ${{ steps.stack.outputs.BUCKET }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CloudFront** | ${{ steps.stack.outputs.CF_ID }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **DynamoDB** | ${{ steps.stack.outputs.TABLE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Lambda** | ${{ steps.stack.outputs.LAMBDA }} |" >> $GITHUB_STEP_SUMMARY
