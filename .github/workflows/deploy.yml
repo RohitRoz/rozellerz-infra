@@ -86,6 +86,7 @@ jobs:
       # ---- Deploy CloudFormation ----
       - name: Deploy CloudFormation stack
         run: |
+          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
           aws cloudformation deploy \
             --template-file cloudformation/stack.yml \
             --stack-name ${{ steps.env.outputs.STACK_NAME }} \
@@ -93,6 +94,7 @@ jobs:
               Environment=${{ steps.env.outputs.ENV }} \
               DomainName=${{ env.DOMAIN_NAME }} \
               AcmCertificateArn="${{ steps.env.outputs.CERT_ARN }}" \
+              DeployBucketName="$DEPLOY_BUCKET" \
             --no-fail-on-empty-changeset \
             --capabilities CAPABILITY_NAMED_IAM
 

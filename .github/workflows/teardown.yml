@@ -69,6 +69,14 @@ jobs:
           aws cloudformation wait stack-delete-complete --stack-name "$STACK"
           echo "Stack $STACK deleted."
 
+      - name: Delete deploy bucket (not managed by CF)
+        run: |
+          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
+          if aws s3api head-bucket --bucket "$DEPLOY_BUCKET" 2>/dev/null; then
+            aws s3api delete-bucket --bucket "$DEPLOY_BUCKET"
+            echo "Deploy bucket $DEPLOY_BUCKET deleted."
+          fi
+
       - name: Teardown summary
         run: |
           echo "## 🗑️ Destroyed ${{ steps.env.outputs.ENV }}" >> $GITHUB_STEP_SUMMARY
