@@ -26,7 +26,7 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+    environment: ${{ github.event.inputs.environment }}
 
     steps:
       - name: Checkout
@@ -47,17 +47,16 @@ jobs:
       - name: Set environment variables
         id: env
         run: |
-          if [[ "${{ github.event.inputs.environment }}" == "prod" ]] || [[ "${{ github.ref }}" == "refs/heads/main" && "${{ github.event_name }}" == "push" ]]; then
-            echo "ENV=prod" >> $GITHUB_OUTPUT
-            echo "STACK_NAME=rozellerz-prod" >> $GITHUB_OUTPUT
+          ENV="${{ github.event.inputs.environment }}"
+          echo "ENV=$ENV" >> $GITHUB_OUTPUT
+          echo "PREFIX=rozellerz-${ENV}" >> $GITHUB_OUTPUT
+          if [[ "$ENV" == "prod" ]]; then
             echo "CERT_ARN=${{ env.ACM_CERT_ARN }}" >> $GITHUB_OUTPUT
           else
-            echo "ENV=dev" >> $GITHUB_OUTPUT
-            echo "STACK_NAME=rozellerz-dev" >> $GITHUB_OUTPUT
             echo "CERT_ARN=" >> $GITHUB_OUTPUT
           fi
 
-      # ---- Bootstrap: ensure deploy bucket exists before CF ----
+      # ---- Bootstrap: deploy bucket ----
       - name: Create deploy bucket if needed
         run: |
           DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
@@ -67,66 +66,101 @@ jobs:
               --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
             aws s3api put-public-access-block --bucket "$DEPLOY_BUCKET" \
               --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-            aws s3api put-bucket-policy --bucket "$DEPLOY_BUCKET" \
-              --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyNonSSL\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::${DEPLOY_BUCKET}\",\"arn:aws:s3:::${DEPLOY_BUCKET}/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
           fi
 
       # ---- Package & upload Lambda ----
       - name: Package Lambda
-        run: |
-          cd api
-          zip -r ../lambda-api.zip .
-          cd ..
+        run: cd api && zip -r ../lambda-api.zip . && cd ..
 
       - name: Upload Lambda to S3
         run: |
           DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
           aws s3 cp lambda-api.zip "s3://${DEPLOY_BUCKET}/lambda/api.zip"
 
-      # ---- Deploy CloudFormation ----
-      - name: Deploy CloudFormation stack
+      # =============================================
+      #  Deploy stacks in dependency order
+      # =============================================
+
+      - name: "Stack 1/5: Foundation"
         run: |
-          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
           aws cloudformation deploy \
-            --template-file cloudformation/stack.yml \
-            --stack-name ${{ steps.env.outputs.STACK_NAME }} \
+            --template-file cloudformation/01-foundation.yml \
+            --stack-name ${{ steps.env.outputs.PREFIX }}-foundation \
             --parameter-overrides \
               Environment=${{ steps.env.outputs.ENV }} \
               DomainName=${{ env.DOMAIN_NAME }} \
-              AcmCertificateArn="${{ steps.env.outputs.CERT_ARN }}" \
+            --no-fail-on-empty-changeset
+
+      - name: "Stack 2/5: WAF"
+        run: |
+          aws cloudformation deploy \
+            --template-file cloudformation/02-waf.yml \
+            --stack-name ${{ steps.env.outputs.PREFIX }}-waf \
+            --parameter-overrides \
+              Environment=${{ steps.env.outputs.ENV }} \
+            --no-fail-on-empty-changeset
+
+      - name: "Stack 3/5: API"
+        run: |
+          DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
+          aws cloudformation deploy \
+            --template-file cloudformation/03-api.yml \
+            --stack-name ${{ steps.env.outputs.PREFIX }}-api \
+            --parameter-overrides \
+              Environment=${{ steps.env.outputs.ENV }} \
+              DomainName=${{ env.DOMAIN_NAME }} \
               DeployBucketName="$DEPLOY_BUCKET" \
               WriteApiSecret="${{ secrets.WRITE_API_SECRET }}" \
             --no-fail-on-empty-changeset \
             --capabilities CAPABILITY_NAMED_IAM
 
-      # ---- Get stack outputs ----
+      - name: "Stack 4/5: CDN"
+        run: |
+          aws cloudformation deploy \
+            --template-file cloudformation/04-cdn.yml \
+            --stack-name ${{ steps.env.outputs.PREFIX }}-cdn \
+            --parameter-overrides \
+              Environment=${{ steps.env.outputs.ENV }} \
+              DomainName=${{ env.DOMAIN_NAME }} \
+              AcmCertificateArn="${{ steps.env.outputs.CERT_ARN }}" \
+            --no-fail-on-empty-changeset
+
+      - name: "Stack 5/5: Monitoring"
+        run: |
+          aws cloudformation deploy \
+            --template-file cloudformation/05-monitoring.yml \
+            --stack-name ${{ steps.env.outputs.PREFIX }}-monitoring \
+            --parameter-overrides \
+              Environment=${{ steps.env.outputs.ENV }} \
+            --no-fail-on-empty-changeset
+
+      # =============================================
+      #  Post-deploy: sync, seed, invalidate
+      # =============================================
+
       - name: Get stack outputs
         id: stack
         run: |
-          get_output() {
-            aws cloudformation describe-stacks \
-              --stack-name ${{ steps.env.outputs.STACK_NAME }} \
-              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
-              --output text
+          get_export() {
+            aws cloudformation list-exports \
+              --query "Exports[?Name=='$1'].Value" --output text
           }
-          echo "BUCKET=$(get_output BucketName)" >> $GITHUB_OUTPUT
-          echo "CF_ID=$(get_output CloudFrontDistributionId)" >> $GITHUB_OUTPUT
-          echo "SITE_URL=$(get_output SiteUrl)" >> $GITHUB_OUTPUT
-          echo "TABLE=$(get_output PagesTableName)" >> $GITHUB_OUTPUT
-          echo "LAMBDA=$(get_output LambdaFunctionName)" >> $GITHUB_OUTPUT
-          echo "API=$(get_output ApiEndpoint)" >> $GITHUB_OUTPUT
+          ENV="${{ steps.env.outputs.ENV }}"
+          echo "BUCKET=$(get_export ${ENV}-rozellerz-site-bucket)" >> $GITHUB_OUTPUT
+          echo "CF_ID=$(get_export ${ENV}-rozellerz-cf-id)" >> $GITHUB_OUTPUT
+          echo "CF_DOMAIN=$(get_export ${ENV}-rozellerz-cf-domain)" >> $GITHUB_OUTPUT
+          echo "TABLE=$(get_export ${ENV}-rozellerz-pages-table)" >> $GITHUB_OUTPUT
+          echo "LAMBDA=$(get_export ${ENV}-rozellerz-lambda-name)" >> $GITHUB_OUTPUT
+          echo "API=$(get_export ${ENV}-rozellerz-api-endpoint)" >> $GITHUB_OUTPUT
 
-      # ---- Sync site to S3 ----
       - name: Sync site to S3
         run: |
           aws s3 sync site/ s3://${{ steps.stack.outputs.BUCKET }}/ \
-            --delete \
-            --cache-control "max-age=86400"
+            --delete --cache-control "max-age=86400"
           aws s3 cp site/index.html s3://${{ steps.stack.outputs.BUCKET }}/index.html \
             --content-type text/html \
             --cache-control "no-cache, no-store, must-revalidate"
 
-      # ---- Update Lambda code ----
       - name: Update Lambda function code
         run: |
           DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
@@ -136,28 +170,34 @@ jobs:
             --s3-key lambda/api.zip \
             --publish
 
-      # ---- Seed DynamoDB (first deploy or manual) ----
       - name: Seed DynamoDB
         if: github.event.inputs.seed_db == 'true'
         run: |
           pip install boto3
           python scripts/seed.py ${{ steps.stack.outputs.TABLE }}
 
-      # ---- Invalidate CloudFront ----
       - name: Invalidate CloudFront
         run: |
           aws cloudfront create-invalidation \
             --distribution-id ${{ steps.stack.outputs.CF_ID }} \
             --paths "/*"
 
-      # ---- Summary ----
       - name: Deploy summary
         run: |
-          echo "## 🚀 Deployed to ${{ steps.env.outputs.ENV }}" >> $GITHUB_STEP_SUMMARY
+          ENV="${{ steps.env.outputs.ENV }}"
+          echo "## 🚀 Deployed to $ENV" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stack | Name |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Foundation | rozellerz-${ENV}-foundation |" >> $GITHUB_STEP_SUMMARY
+          echo "| WAF | rozellerz-${ENV}-waf |" >> $GITHUB_STEP_SUMMARY
+          echo "| API | rozellerz-${ENV}-api |" >> $GITHUB_STEP_SUMMARY
+          echo "| CDN | rozellerz-${ENV}-cdn |" >> $GITHUB_STEP_SUMMARY
+          echo "| Monitoring | rozellerz-${ENV}-monitoring |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Site** | ${{ steps.stack.outputs.SITE_URL }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Site** | https://${{ steps.stack.outputs.CF_DOMAIN }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **API** | ${{ steps.stack.outputs.API }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Bucket** | ${{ steps.stack.outputs.BUCKET }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **CloudFront** | ${{ steps.stack.outputs.CF_ID }} |" >> $GITHUB_STEP_SUMMARY

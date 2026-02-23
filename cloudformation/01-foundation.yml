@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: rozellerz.com — Foundation (S3, DynamoDB, SQS DLQ)
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [prod, dev]
+    Default: dev
+  DomainName:
+    Type: String
+    Default: rozellerz.com
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+
+  # =========================================
+  #  S3 — Access Logging
+  # =========================================
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-rozellerz-access-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # =========================================
+  #  S3 — Static Assets
+  # =========================================
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - IsProd
+        - !Ref DomainName
+        - !Sub 'dev-${DomainName}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: !Sub 's3-access/${Environment}/'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =========================================
+  #  DynamoDB — Page Content
+  # =========================================
+  PagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-rozellerz-pages'
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      AttributeDefinitions:
+        - AttributeName: slug
+          AttributeType: S
+      KeySchema:
+        - AttributeName: slug
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =========================================
+  #  SQS — Lambda Dead Letter Queue
+  # =========================================
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-rozellerz-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  SiteBucketName:
+    Value: !Ref SiteBucket
+    Export:
+      Name: !Sub '${Environment}-rozellerz-site-bucket'
+  SiteBucketArn:
+    Value: !GetAtt SiteBucket.Arn
+    Export:
+      Name: !Sub '${Environment}-rozellerz-site-bucket-arn'
+  SiteBucketRegionalDomain:
+    Value: !GetAtt SiteBucket.RegionalDomainName
+    Export:
+      Name: !Sub '${Environment}-rozellerz-site-bucket-domain'
+  AccessLogBucketName:
+    Value: !Ref AccessLogBucket
+    Export:
+      Name: !Sub '${Environment}-rozellerz-access-log-bucket'
+  PagesTableName:
+    Value: !Ref PagesTable
+    Export:
+      Name: !Sub '${Environment}-rozellerz-pages-table'
+  PagesTableArn:
+    Value: !GetAtt PagesTable.Arn
+    Export:
+      Name: !Sub '${Environment}-rozellerz-pages-table-arn'
+  DLQArn:
+    Value: !GetAtt LambdaDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${Environment}-rozellerz-dlq-arn'
+  DLQName:
+    Value: !GetAtt LambdaDeadLetterQueue.QueueName
+    Export:
+      Name: !Sub '${Environment}-rozellerz-dlq-name'

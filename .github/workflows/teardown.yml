@@ -36,8 +36,9 @@ jobs:
       - name: Set variables
         id: env
         run: |
-          echo "STACK_NAME=rozellerz-${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
-          echo "ENV=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          ENV="${{ github.event.inputs.environment }}"
+          echo "ENV=$ENV" >> $GITHUB_OUTPUT
+          echo "PREFIX=rozellerz-${ENV}" >> $GITHUB_OUTPUT
 
       - name: Empty S3 buckets
         run: |
@@ -48,7 +49,6 @@ jobs:
             if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
               echo "Emptying $BUCKET..."
               aws s3 rm "s3://${BUCKET}" --recursive
-              # Also delete old versions
               aws s3api list-object-versions --bucket "$BUCKET" --output json \
                 | python3 -c "
           import sys, json
@@ -67,25 +67,47 @@ jobs:
           TABLE="${{ steps.env.outputs.ENV }}-rozellerz-pages"
           aws dynamodb update-table --table-name "$TABLE" --no-deletion-protection-enabled 2>/dev/null || true
 
-      - name: Delete CloudFormation stack
+      # ---- Delete stacks in reverse dependency order ----
+      - name: "Delete 1/5: Monitoring"
         run: |
-          STACK="${{ steps.env.outputs.STACK_NAME }}"
-          echo "Deleting stack: $STACK"
-          aws cloudformation delete-stack --stack-name "$STACK"
-          echo "Waiting for stack deletion..."
-          aws cloudformation wait stack-delete-complete --stack-name "$STACK"
-          echo "Stack $STACK deleted."
+          STACK="${{ steps.env.outputs.PREFIX }}-monitoring"
+          aws cloudformation delete-stack --stack-name "$STACK" 2>/dev/null || true
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK" 2>/dev/null || true
 
-      - name: Delete deploy bucket (not managed by CF)
+      - name: "Delete 2/5: CDN"
+        run: |
+          STACK="${{ steps.env.outputs.PREFIX }}-cdn"
+          aws cloudformation delete-stack --stack-name "$STACK"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+
+      - name: "Delete 3/5: API"
+        run: |
+          STACK="${{ steps.env.outputs.PREFIX }}-api"
+          aws cloudformation delete-stack --stack-name "$STACK"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+
+      - name: "Delete 4/5: WAF"
+        run: |
+          STACK="${{ steps.env.outputs.PREFIX }}-waf"
+          aws cloudformation delete-stack --stack-name "$STACK"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+
+      - name: "Delete 5/5: Foundation"
+        run: |
+          STACK="${{ steps.env.outputs.PREFIX }}-foundation"
+          aws cloudformation delete-stack --stack-name "$STACK"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+
+      - name: Delete deploy bucket (bootstrap, not in CF)
         run: |
           DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
           if aws s3api head-bucket --bucket "$DEPLOY_BUCKET" 2>/dev/null; then
             aws s3api delete-bucket --bucket "$DEPLOY_BUCKET"
-            echo "Deploy bucket $DEPLOY_BUCKET deleted."
           fi
 
       - name: Teardown summary
         run: |
           echo "## 🗑️ Destroyed ${{ steps.env.outputs.ENV }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Stack **${{ steps.env.outputs.STACK_NAME }}** and all resources deleted." >> $GITHUB_STEP_SUMMARY
+          echo "All 5 stacks deleted:" >> $GITHUB_STEP_SUMMARY
+          echo "- monitoring → cdn → api → waf → foundation" >> $GITHUB_STEP_SUMMARY
