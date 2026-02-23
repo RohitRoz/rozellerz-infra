@@ -43,7 +43,8 @@ jobs:
         run: |
           SITE_BUCKET="${{ steps.env.outputs.ENV == 'prod' && 'rozellerz.com' || 'dev-rozellerz.com' }}"
           DEPLOY_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-deploy"
-          for BUCKET in "$SITE_BUCKET" "$DEPLOY_BUCKET"; do
+          LOG_BUCKET="${{ steps.env.outputs.ENV }}-rozellerz-access-logs"
+          for BUCKET in "$SITE_BUCKET" "$DEPLOY_BUCKET" "$LOG_BUCKET"; do
             if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
               echo "Emptying $BUCKET..."
               aws s3 rm "s3://${BUCKET}" --recursive
@@ -59,6 +60,12 @@ jobs:
               done
             fi
           done
+
+      - name: Disable DynamoDB deletion protection (prod)
+        if: steps.env.outputs.ENV == 'prod'
+        run: |
+          TABLE="${{ steps.env.outputs.ENV }}-rozellerz-pages"
+          aws dynamodb update-table --table-name "$TABLE" --no-deletion-protection-enabled 2>/dev/null || true
 
       - name: Delete CloudFormation stack
         run: |
