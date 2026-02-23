@@ -74,8 +74,8 @@ Resources:
         Comment: !Sub '${Environment} - rozellerz.com'
         HttpVersion: http2and3
         PriceClass: PriceClass_100
-        WebACLId: !ImportValue
-          !Sub '${Environment}-rozellerz-waf-arn'
+        WebACLId:
+          Fn::ImportValue: !Sub '${Environment}-rozellerz-waf-arn'
         Aliases: !If
           - HasCertificate
           - - !If [IsProd, !Sub 'www.${DomainName}', !Ref 'AWS::NoValue']
@@ -88,14 +88,14 @@ Resources:
           - CloudFrontDefaultCertificate: true
         Origins:
           - Id: S3Origin
-            DomainName: !ImportValue
-              !Sub '${Environment}-rozellerz-site-bucket-domain'
+            DomainName:
+              Fn::ImportValue: !Sub '${Environment}-rozellerz-site-bucket-domain'
             OriginAccessControlId: !Ref CloudFrontOAC
             S3OriginConfig:
               OriginAccessIdentity: ''
           - Id: ApiOrigin
-            DomainName: !ImportValue
-              !Sub '${Environment}-rozellerz-http-api-domain'
+            DomainName:
+              Fn::ImportValue: !Sub '${Environment}-rozellerz-http-api-domain'
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
               OriginSSLProtocols: [TLSv1.2]
@@ -133,8 +133,8 @@ Resources:
   BucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
-      Bucket: !ImportValue
-        !Sub '${Environment}-rozellerz-site-bucket'
+      Bucket:
+        Fn::ImportValue: !Sub '${Environment}-rozellerz-site-bucket'
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -145,8 +145,8 @@ Resources:
             Action: s3:GetObject
             Resource: !Sub
               - '${BucketArn}/*'
-              - BucketArn: !ImportValue
-                  !Sub '${Environment}-rozellerz-site-bucket-arn'
+              - BucketArn:
+                  Fn::ImportValue: !Sub '${Environment}-rozellerz-site-bucket-arn'
             Condition:
               StringEquals:
                 'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
@@ -155,12 +155,11 @@ Resources:
             Principal: '*'
             Action: 's3:*'
             Resource:
-              - !ImportValue
-                  !Sub '${Environment}-rozellerz-site-bucket-arn'
+              - Fn::ImportValue: !Sub '${Environment}-rozellerz-site-bucket-arn'
               - !Sub
                 - '${BucketArn}/*'
-                - BucketArn: !ImportValue
-                    !Sub '${Environment}-rozellerz-site-bucket-arn'
+                - BucketArn:
+                    Fn::ImportValue: !Sub '${Environment}-rozellerz-site-bucket-arn'
             Condition:
               Bool:
                 'aws:SecureTransport': 'false'

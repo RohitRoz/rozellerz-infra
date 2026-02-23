@@ -81,16 +81,14 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:Scan
                 Resource:
-                  - !ImportValue
-                      !Sub '${Environment}-rozellerz-pages-table-arn'
+                  - Fn::ImportValue: !Sub '${Environment}-rozellerz-pages-table-arn'
               - Sid: DynamoDBWrite
                 Effect: Allow
                 Action:
                   - dynamodb:PutItem
                   - dynamodb:DeleteItem
                 Resource:
-                  - !ImportValue
-                      !Sub '${Environment}-rozellerz-pages-table-arn'
+                  - Fn::ImportValue: !Sub '${Environment}-rozellerz-pages-table-arn'
         - PolicyName: DeadLetterQueueAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -99,8 +97,7 @@ Resources:
                 Action:
                   - sqs:SendMessage
                 Resource:
-                  - !ImportValue
-                      !Sub '${Environment}-rozellerz-dlq-arn'
+                  - Fn::ImportValue: !Sub '${Environment}-rozellerz-dlq-arn'
 
   # =========================================
   #  Lambda — API Backend
@@ -116,15 +113,15 @@ Resources:
       Timeout: 10
       MemorySize: 256
       DeadLetterConfig:
-        TargetArn: !ImportValue
-          !Sub '${Environment}-rozellerz-dlq-arn'
+        TargetArn:
+          Fn::ImportValue: !Sub '${Environment}-rozellerz-dlq-arn'
       Code:
         S3Bucket: !Ref DeployBucketName
         S3Key: lambda/api.zip
       Environment:
         Variables:
-          TABLE_NAME: !ImportValue
-            !Sub '${Environment}-rozellerz-pages-table'
+          TABLE_NAME:
+            Fn::ImportValue: !Sub '${Environment}-rozellerz-pages-table'
           ENVIRONMENT: !Ref Environment
           ALLOWED_ORIGIN: !If
             - IsProd
