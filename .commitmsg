@@ -1,0 +1,1 @@
+fix: disable auto-deploy on push, manual workflow_dispatch only
