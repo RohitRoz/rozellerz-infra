@@ -1,0 +1,1 @@
+fix: lower Lambda reserved concurrency to 5 (account limit)
