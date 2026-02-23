@@ -473,8 +473,7 @@ Resources:
         WebACLId: !GetAtt WafWebAcl.Arn
         Aliases: !If
           - HasCertificate
-          - - !If [IsProd, !Ref DomainName, !Ref 'AWS::NoValue']
-            - !If [IsProd, !Sub 'www.${DomainName}', !Ref 'AWS::NoValue']
+          - - !If [IsProd, !Sub 'www.${DomainName}', !Ref 'AWS::NoValue']
           - !Ref 'AWS::NoValue'
         ViewerCertificate: !If
           - HasCertificate
