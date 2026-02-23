@@ -235,7 +235,6 @@ Resources:
       Role: !GetAtt LambdaRole.Arn
       Timeout: 10
       MemorySize: 256
-      ReservedConcurrentExecutions: 5
       DeadLetterConfig:
         TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
       Code:
